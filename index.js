@@ -1,5 +1,3 @@
-我现在的index.ts是这样的，你帮我改一下
-
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
