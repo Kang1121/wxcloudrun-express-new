@@ -2,6 +2,7 @@ const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
+const https = require("https");
 const { init: initDB, Counter } = require("./db");
 
 const logger = morgan("tiny");
@@ -11,6 +12,100 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(cors());
 app.use(logger);
+
+let accessTokenCache = {
+  token: "",
+  expiresAt: 0,
+};
+
+function getEnvId() {
+  return (
+    process.env.WX_CLOUD_ENV ||
+    process.env.TCB_ENV ||
+    process.env.CLOUD_ENV ||
+    ""
+  );
+}
+
+function getAppConfig() {
+  const appid = process.env.WX_APPID || process.env.WECHAT_APPID || "";
+  const secret = process.env.WX_APPSECRET || process.env.WECHAT_APPSECRET || "";
+  return { appid, secret };
+}
+
+function requestJson(url, options, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, options, (res) => {
+      let raw = "";
+      res.on("data", (chunk) => {
+        raw += chunk;
+      });
+      res.on("end", () => {
+        try {
+          const data = raw ? JSON.parse(raw) : {};
+          resolve({ statusCode: res.statusCode, data });
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function getAccessToken() {
+  if (process.env.WX_ACCESS_TOKEN) return process.env.WX_ACCESS_TOKEN;
+  if (accessTokenCache.token && accessTokenCache.expiresAt > Date.now()) {
+    return accessTokenCache.token;
+  }
+
+  const { appid, secret } = getAppConfig();
+  if (!appid || !secret) {
+    throw new Error("缺少 WX_APPID/WX_APPSECRET，无法获取 access_token");
+  }
+
+  const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${appid}&secret=${secret}`;
+  const { data } = await requestJson(url, { method: "GET" });
+  if (!data || !data.access_token) {
+    throw new Error(`获取 access_token 失败: ${data?.errmsg || "unknown"}`);
+  }
+
+  const expiresIn = Number(data.expires_in || 7200);
+  accessTokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + Math.max(60, expiresIn - 300) * 1000,
+  };
+  return accessTokenCache.token;
+}
+
+async function invokeCloudFunction(name, payload) {
+  const envId = getEnvId();
+  if (!envId) {
+    throw new Error("缺少云环境 ID：请设置 WX_CLOUD_ENV 或 TCB_ENV");
+  }
+  const accessToken = await getAccessToken();
+  const url =
+    `https://api.weixin.qq.com/tcb/invokecloudfunction` +
+    `?access_token=${accessToken}&env=${envId}&name=${name}`;
+  const body = JSON.stringify(payload || {});
+  const { data } = await requestJson(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    },
+    body
+  );
+  if (data?.errcode && data.errcode !== 0) {
+    throw new Error(`调用云函数失败: ${data.errmsg || data.errcode}`);
+  }
+  return data;
+}
 
 /**
  * ===============================
@@ -75,80 +170,21 @@ app.post("/wxpush", async (req, res) => {
   // 2️⃣ 内容安全异步回调（图片审核）
   if (body?.Event === "wxa_media_check") {
     const { trace_id, result } = body;
-    const suggest = result?.suggest;
-    const label = result?.label;
 
     console.log("[wxpush] media check result:", {
       trace_id,
-      suggest,
-      label,
+      suggest: result?.suggest,
+      label: result?.label,
     });
 
     try {
-      const db = require("wx-server-sdk").database();
-
-      // ① 找到对应 review（一张图只会命中一个）
-      const reviewRes = await db
-        .collection("reviews_content")
-        .where({
-          mediaTraceIds: trace_id,
-          status: "pending",
-        })
-        .limit(1)
-        .get();
-
-      if (!reviewRes.data.length) {
-        console.warn("[wxpush] review not found for trace_id:", trace_id);
-        return res.send("success");
-      }
-
-      const review = reviewRes.data[0];
-
-      // ② 记录单张图片的审核结果（按 trace_id 存）
-      const mediaResults = review.mediaResults || {};
-      mediaResults[trace_id] = {
-        suggest,
-        label,
-        raw: result,
-      };
-
-      // ③ 是否存在不通过的图片
-      const hasReject = Object.values(mediaResults).some(
-        (r) => r.suggest !== "pass"
-      );
-
-      // ④ 是否所有图片都已回调
-      const allReturned =
-        Object.keys(mediaResults).length === review.mediaTraceIds.length;
-
-      let nextStatus = "pending";
-
-      if (hasReject) {
-        nextStatus = "reject";
-      } else if (allReturned) {
-        nextStatus = "pass";
-      }
-
-      // ⑤ 更新 review 状态
-      await db.collection("reviews_content").doc(review._id).update({
+      await invokeCloudFunction("post", {
+        action: "review.updateMediaResult",
         data: {
-          status: nextStatus,
-          mediaResults,
-          updatedAt: new Date(),
+          traceId: trace_id,
+          result,
         },
       });
-
-      console.log("[wxpush] review updated:", {
-        reviewId: review._id,
-        status: nextStatus,
-        returned: Object.keys(mediaResults).length,
-        total: review.mediaTraceIds.length,
-      });
-
-      // ⑥ 所有图片通过 → 正式发布
-      if (nextStatus === "pass") {
-        await publishPostFromReview(db, review);
-      }
     } catch (err) {
       console.error("[wxpush] handle error:", err);
     }
@@ -170,32 +206,3 @@ async function bootstrap() {
 }
 
 bootstrap();
-
-/**
- * 审核通过 → 正式发布帖子
- */
-async function publishPostFromReview(db, review) {
-  if (!review.payload) return;
-
-  const payload = review.payload;
-  const now = new Date();
-
-  const postData = {
-    ...payload,
-    createdAt: now,
-    updatedAt: now,
-    likeCount: 0,
-    commentCount: 0,
-    viewCount: 0,
-  };
-
-  const res = await db.collection("posts").add({ data: postData });
-
-  await db.collection("reviews_content").doc(review._id).update({
-    data: {
-      publishedPostId: res._id,
-    },
-  });
-
-  console.log("[wxpush] post published:", res._id);
-}
