@@ -170,3 +170,32 @@ async function bootstrap() {
 }
 
 bootstrap();
+
+/**
+ * 审核通过 → 正式发布帖子
+ */
+async function publishPostFromReview(db, review) {
+  if (!review.payload) return;
+
+  const payload = review.payload;
+  const now = new Date();
+
+  const postData = {
+    ...payload,
+    createdAt: now,
+    updatedAt: now,
+    likeCount: 0,
+    commentCount: 0,
+    viewCount: 0,
+  };
+
+  const res = await db.collection("posts").add({ data: postData });
+
+  await db.collection("reviews_content").doc(review._id).update({
+    data: {
+      publishedPostId: res._id,
+    },
+  });
+
+  console.log("[wxpush] post published:", res._id);
+}
