@@ -104,7 +104,18 @@ async function invokeCloudFunction(name, payload) {
   if (data?.errcode && data.errcode !== 0) {
     throw new Error(`调用云函数失败: ${data.errmsg || data.errcode}`);
   }
-  return data;
+  let parsedRespData = null;
+  if (typeof data?.resp_data === "string" && data.resp_data.trim()) {
+    try {
+      parsedRespData = JSON.parse(data.resp_data);
+    } catch (err) {
+      parsedRespData = { _parseError: err?.message || "PARSE_ERROR", raw: data.resp_data };
+    }
+  }
+  return {
+    ...data,
+    parsedRespData,
+  };
 }
 
 /**
@@ -178,13 +189,14 @@ app.post("/wxpush", async (req, res) => {
     });
 
     try {
-      await invokeCloudFunction("post", {
+      const invokeRes = await invokeCloudFunction("post", {
         action: "review.updateMediaResult",
         data: {
           traceId: trace_id,
           result,
         },
       });
+      console.log("[wxpush] invoke post result:", invokeRes?.parsedRespData || invokeRes);
     } catch (err) {
       console.error("[wxpush] handle error:", err);
     }
