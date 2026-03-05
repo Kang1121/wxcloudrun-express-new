@@ -189,14 +189,23 @@ app.post("/wxpush", async (req, res) => {
     });
 
     try {
-      const invokeRes = await invokeCloudFunction("post", {
+      const invokePostRes = await invokeCloudFunction("post", {
         action: "review.updateMediaResult",
         data: {
           traceId: trace_id,
           result,
         },
       });
-      console.log("[wxpush] invoke post result:", invokeRes?.parsedRespData || invokeRes);
+      console.log("[wxpush] invoke post result:", invokePostRes?.parsedRespData || invokePostRes);
+
+      const invokeAuthRes = await invokeCloudFunction("auth", {
+        action: "reviewProfile.updateMediaResult",
+        data: {
+          traceId: trace_id,
+          result,
+        },
+      });
+      console.log("[wxpush] invoke auth result:", invokeAuthRes?.parsedRespData || invokeAuthRes);
     } catch (err) {
       console.error("[wxpush] handle error:", err);
     }
