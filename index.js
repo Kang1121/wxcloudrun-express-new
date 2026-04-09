@@ -4,6 +4,7 @@ const cors = require("cors");
 const morgan = require("morgan");
 const https = require("https");
 const { init: initDB, Counter } = require("./db");
+const { handleBridgeRequest } = require("./bridge");
 
 const logger = morgan("tiny");
 
@@ -129,6 +130,18 @@ app.get("/", async (req, res) => {
 
 /**
  * ===============================
+ * iOS BFF 上游 Bridge
+ * ===============================
+ */
+app.post("/functions/:functionName", async (req, res) => {
+  await handleBridgeRequest(req, res, {
+    invokeCloudFunctionImpl: invokeCloudFunction,
+    env: process.env,
+  });
+});
+
+/**
+ * ===============================
  * 示例业务接口（原有）
  * ===============================
  */
@@ -226,4 +239,17 @@ async function bootstrap() {
   });
 }
 
-bootstrap();
+if (require.main === module) {
+  bootstrap().catch((error) => {
+    console.error("启动失败", error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  app,
+  bootstrap,
+  getAccessToken,
+  invokeCloudFunction,
+  requestJson,
+};
