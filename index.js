@@ -19,13 +19,31 @@ let accessTokenCache = {
   expiresAt: 0,
 };
 
-function getEnvId() {
-  return (
+function normalizeEnvId(value) {
+  return String(value || "").trim();
+}
+
+function getDefaultEnvId() {
+  return normalizeEnvId(
     process.env.WX_CLOUD_ENV ||
     process.env.TCB_ENV ||
     process.env.CLOUD_ENV ||
     ""
   );
+}
+
+function getWxpushTargetEnvIds() {
+  const rawList = [
+    ...String(process.env.WX_CLOUD_ENV_TARGETS || "")
+      .split(",")
+      .map((item) => normalizeEnvId(item)),
+    normalizeEnvId(process.env.WX_CLOUD_ENV_DEV),
+    normalizeEnvId(process.env.WX_CLOUD_ENV_PROD),
+    normalizeEnvId(process.env.WX_CLOUD_ENV_CLOUD),
+    getDefaultEnvId(),
+  ].filter(Boolean);
+
+  return Array.from(new Set(rawList));
 }
 
 function getAppConfig() {
@@ -81,8 +99,8 @@ async function getAccessToken() {
   return accessTokenCache.token;
 }
 
-async function invokeCloudFunction(name, payload) {
-  const envId = getEnvId();
+async function invokeCloudFunction(name, payload, targetEnvId) {
+  const envId = normalizeEnvId(targetEnvId) || getDefaultEnvId();
   if (!envId) {
     throw new Error("缺少云环境 ID：请设置 WX_CLOUD_ENV 或 TCB_ENV");
   }
@@ -116,6 +134,60 @@ async function invokeCloudFunction(name, payload) {
   return {
     ...data,
     parsedRespData,
+  };
+}
+
+async function invokeWxpushCloudFunctions(payload) {
+  const envIds = getWxpushTargetEnvIds();
+  if (envIds.length === 0) {
+    throw new Error("缺少消息推送目标环境 ID：请设置 WX_CLOUD_ENV_TARGETS 或 WX_CLOUD_ENV_DEV/WX_CLOUD_ENV_PROD");
+  }
+
+  const taskSpecs = envIds.flatMap((envId) => ([
+    {
+      envId,
+      functionName: "post",
+      payload: {
+        action: "review.updateMediaResult",
+        data: payload,
+      },
+    },
+    {
+      envId,
+      functionName: "auth",
+      payload: {
+        action: "reviewProfile.updateMediaResult",
+        data: payload,
+      },
+    },
+  ]));
+
+  const settled = await Promise.allSettled(taskSpecs.map((spec) => (
+    invokeCloudFunction(spec.functionName, spec.payload, spec.envId)
+  )));
+
+  const results = settled.map((item, index) => {
+    const spec = taskSpecs[index];
+    if (item.status === "fulfilled") {
+      return {
+        ok: true,
+        envId: spec.envId,
+        functionName: spec.functionName,
+        result: item.value?.parsedRespData || item.value,
+      };
+    }
+    return {
+      ok: false,
+      envId: spec.envId,
+      functionName: spec.functionName,
+      error: item.reason?.message || String(item.reason || "UNKNOWN_ERROR"),
+    };
+  });
+
+  return {
+    envIds,
+    results,
+    hasFailure: results.some((item) => !item.ok),
   };
 }
 
@@ -202,23 +274,14 @@ app.post("/wxpush", async (req, res) => {
     });
 
     try {
-      const invokePostRes = await invokeCloudFunction("post", {
-        action: "review.updateMediaResult",
-        data: {
-          traceId: trace_id,
-          result,
-        },
+      const fanout = await invokeWxpushCloudFunctions({
+        traceId: trace_id,
+        result,
       });
-      console.log("[wxpush] invoke post result:", invokePostRes?.parsedRespData || invokePostRes);
-
-      const invokeAuthRes = await invokeCloudFunction("auth", {
-        action: "reviewProfile.updateMediaResult",
-        data: {
-          traceId: trace_id,
-          result,
-        },
-      });
-      console.log("[wxpush] invoke auth result:", invokeAuthRes?.parsedRespData || invokeAuthRes);
+      console.log("[wxpush] invoke results:", fanout.results);
+      if (fanout.hasFailure) {
+        console.warn("[wxpush] partial failure:", fanout.results.filter((item) => !item.ok));
+      }
     } catch (err) {
       console.error("[wxpush] handle error:", err);
     }
@@ -251,5 +314,6 @@ module.exports = {
   bootstrap,
   getAccessToken,
   invokeCloudFunction,
+  invokeWxpushCloudFunctions,
   requestJson,
 };
