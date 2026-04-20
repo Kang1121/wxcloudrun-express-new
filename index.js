@@ -191,6 +191,62 @@ async function invokeWxpushCloudFunctions(payload) {
   };
 }
 
+function summarizeInvokeResult(item) {
+  const base = {
+    envId: item.envId,
+    functionName: item.functionName,
+    ok: !!item.ok,
+  };
+  if (!item.ok) {
+    return {
+      ...base,
+      status: "error",
+      error: item.error || "UNKNOWN_ERROR",
+    };
+  }
+
+  const result = item.result || {};
+  const code = typeof result.code === "number" ? result.code : 0;
+  const message = String(result.message || "").trim();
+  const data = result.data;
+  const status =
+    message
+      || (data ? "updated" : "ok");
+
+  const summary = {
+    ...base,
+    code,
+    status,
+  };
+
+  if (data && typeof data === "object") {
+    if (data.status) summary.reviewStatus = data.status;
+    if (data.postId) summary.postId = data.postId;
+    if (data.publishedPostId) summary.publishedPostId = data.publishedPostId;
+  }
+
+  return summary;
+}
+
+function buildWxpushLogSummary({ traceId, result, fanout }) {
+  const summarizedResults = Array.isArray(fanout?.results)
+    ? fanout.results.map((item) => summarizeInvokeResult(item))
+    : [];
+  const matchedResults = summarizedResults.filter((item) => item.status !== "not_found");
+  const errorResults = summarizedResults.filter((item) => item.status === "error");
+
+  return {
+    traceId,
+    suggest: result?.suggest || "",
+    label: result?.label ?? null,
+    targetEnvIds: fanout?.envIds || [],
+    totalInvocations: summarizedResults.length,
+    matchedInvocations: matchedResults.length,
+    errorInvocations: errorResults.length,
+    results: summarizedResults,
+  };
+}
+
 /**
  * ===============================
  * 首页
@@ -278,9 +334,17 @@ app.post("/wxpush", async (req, res) => {
         traceId: trace_id,
         result,
       });
-      console.log("[wxpush] invoke results:", fanout.results);
+      const summary = buildWxpushLogSummary({
+        traceId: trace_id,
+        result,
+        fanout,
+      });
+      console.log("[wxpush] invoke summary:", summary);
       if (fanout.hasFailure) {
-        console.warn("[wxpush] partial failure:", fanout.results.filter((item) => !item.ok));
+        console.warn(
+          "[wxpush] partial failure:",
+          summary.results.filter((item) => item.status === "error")
+        );
       }
     } catch (err) {
       console.error("[wxpush] handle error:", err);
