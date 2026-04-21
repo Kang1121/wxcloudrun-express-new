@@ -46,6 +46,13 @@ function getWxpushTargetEnvIds() {
   return Array.from(new Set(rawList));
 }
 
+function shouldInvokeLegacyPostMediaCallback() {
+  const raw = String(process.env.WXPUSH_LEGACY_POST_MEDIA_CALLBACK || "true")
+    .trim()
+    .toLowerCase();
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
 function getAppConfig() {
   const appid = process.env.WX_APPID || process.env.WECHAT_APPID || "";
   const secret = process.env.WX_APPSECRET || process.env.WECHAT_APPSECRET || "";
@@ -143,24 +150,46 @@ async function invokeWxpushCloudFunctions(payload) {
     throw new Error("缺少消息推送目标环境 ID：请设置 WX_CLOUD_ENV_TARGETS 或 WX_CLOUD_ENV_DEV/WX_CLOUD_ENV_PROD");
   }
 
-  const taskSpecs = envIds.flatMap((envId) => ([
-    {
-      envId,
-      functionName: "post",
-      payload: {
-        action: "review.updateMediaResult",
-        data: payload,
+  const taskSpecs = envIds.flatMap((envId) => {
+    const specs = [
+      {
+        envId,
+        functionName: "sec-callback",
+        payload: {
+          body: JSON.stringify({
+            Event: "wxa_media_check",
+            trace_id: payload.traceId || payload.trace_id || "",
+            traceId: payload.traceId || payload.trace_id || "",
+            result: payload.result || {},
+            isRisky: payload.isRisky,
+          }),
+          isBase64Encoded: false,
+          queryStringParameters: {},
+        },
       },
-    },
-    {
-      envId,
-      functionName: "auth",
-      payload: {
-        action: "reviewProfile.updateMediaResult",
-        data: payload,
+      {
+        envId,
+        functionName: "auth",
+        payload: {
+          action: "reviewProfile.updateMediaResult",
+          data: payload,
+        },
       },
-    },
-  ]));
+    ];
+
+    if (shouldInvokeLegacyPostMediaCallback()) {
+      specs.push({
+        envId,
+        functionName: "post",
+        payload: {
+          action: "review.updateMediaResult",
+          data: payload,
+        },
+      });
+    }
+
+    return specs;
+  });
 
   const settled = await Promise.allSettled(taskSpecs.map((spec) => (
     invokeCloudFunction(spec.functionName, spec.payload, spec.envId)
@@ -188,62 +217,6 @@ async function invokeWxpushCloudFunctions(payload) {
     envIds,
     results,
     hasFailure: results.some((item) => !item.ok),
-  };
-}
-
-function summarizeInvokeResult(item) {
-  const base = {
-    envId: item.envId,
-    functionName: item.functionName,
-    ok: !!item.ok,
-  };
-  if (!item.ok) {
-    return {
-      ...base,
-      status: "error",
-      error: item.error || "UNKNOWN_ERROR",
-    };
-  }
-
-  const result = item.result || {};
-  const code = typeof result.code === "number" ? result.code : 0;
-  const message = String(result.message || "").trim();
-  const data = result.data;
-  const status =
-    message
-      || (data ? "updated" : "ok");
-
-  const summary = {
-    ...base,
-    code,
-    status,
-  };
-
-  if (data && typeof data === "object") {
-    if (data.status) summary.reviewStatus = data.status;
-    if (data.postId) summary.postId = data.postId;
-    if (data.publishedPostId) summary.publishedPostId = data.publishedPostId;
-  }
-
-  return summary;
-}
-
-function buildWxpushLogSummary({ traceId, result, fanout }) {
-  const summarizedResults = Array.isArray(fanout?.results)
-    ? fanout.results.map((item) => summarizeInvokeResult(item))
-    : [];
-  const matchedResults = summarizedResults.filter((item) => item.status !== "not_found");
-  const errorResults = summarizedResults.filter((item) => item.status === "error");
-
-  return {
-    traceId,
-    suggest: result?.suggest || "",
-    label: result?.label ?? null,
-    targetEnvIds: fanout?.envIds || [],
-    totalInvocations: summarizedResults.length,
-    matchedInvocations: matchedResults.length,
-    errorInvocations: errorResults.length,
-    results: summarizedResults,
   };
 }
 
@@ -333,18 +306,11 @@ app.post("/wxpush", async (req, res) => {
       const fanout = await invokeWxpushCloudFunctions({
         traceId: trace_id,
         result,
+        isRisky: body?.isRisky,
       });
-      const summary = buildWxpushLogSummary({
-        traceId: trace_id,
-        result,
-        fanout,
-      });
-      console.log("[wxpush] invoke summary:", summary);
+      console.log("[wxpush] invoke results:", fanout.results);
       if (fanout.hasFailure) {
-        console.warn(
-          "[wxpush] partial failure:",
-          summary.results.filter((item) => item.status === "error")
-        );
+        console.warn("[wxpush] partial failure:", fanout.results.filter((item) => !item.ok));
       }
     } catch (err) {
       console.error("[wxpush] handle error:", err);
