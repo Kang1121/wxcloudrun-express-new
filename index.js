@@ -59,6 +59,24 @@ function getAppConfig() {
   return { appid, secret };
 }
 
+function shouldUseStableAccessToken() {
+  const raw = String(process.env.WX_USE_STABLE_ACCESS_TOKEN || "true")
+    .trim()
+    .toLowerCase();
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
+function isInvalidCredentialResponse(data) {
+  const errcode = Number(data?.errcode || data?.errCode || 0);
+  const errmsg = String(data?.errmsg || data?.errMsg || "").toLowerCase();
+  return errcode === 40001
+    || errcode === 40014
+    || errcode === 42001
+    || errmsg.includes("invalid credential")
+    || errmsg.includes("access_token is invalid")
+    || errmsg.includes("not latest");
+}
+
 function requestJson(url, options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(url, options, (res) => {
@@ -81,9 +99,36 @@ function requestJson(url, options, body) {
   });
 }
 
-async function getAccessToken() {
-  if (process.env.WX_ACCESS_TOKEN) return process.env.WX_ACCESS_TOKEN;
-  if (accessTokenCache.token && accessTokenCache.expiresAt > Date.now()) {
+async function fetchLegacyAccessToken(appid, secret) {
+  const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${appid}&secret=${secret}`;
+  const { data } = await requestJson(url, { method: "GET" });
+  return data || {};
+}
+
+async function fetchStableAccessToken(appid, secret, forceRefresh) {
+  const body = JSON.stringify({
+    grant_type: "client_credential",
+    appid,
+    secret,
+    force_refresh: !!forceRefresh,
+  });
+  const { data } = await requestJson(
+    "https://api.weixin.qq.com/cgi-bin/stable_token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    },
+    body
+  );
+  return data || {};
+}
+
+async function getAccessToken(options = {}) {
+  if (process.env.WX_ACCESS_TOKEN && !options.forceRefresh) return process.env.WX_ACCESS_TOKEN;
+  if (!options.forceRefresh && accessTokenCache.token && accessTokenCache.expiresAt > Date.now()) {
     return accessTokenCache.token;
   }
 
@@ -92,8 +137,9 @@ async function getAccessToken() {
     throw new Error("缺少 WX_APPID/WX_APPSECRET，无法获取 access_token");
   }
 
-  const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${appid}&secret=${secret}`;
-  const { data } = await requestJson(url, { method: "GET" });
+  const data = shouldUseStableAccessToken()
+    ? await fetchStableAccessToken(appid, secret, !!options.forceRefresh)
+    : await fetchLegacyAccessToken(appid, secret);
   if (!data || !data.access_token) {
     throw new Error(`获取 access_token 失败: ${data?.errmsg || "unknown"}`);
   }
@@ -106,17 +152,12 @@ async function getAccessToken() {
   return accessTokenCache.token;
 }
 
-async function invokeCloudFunction(name, payload, targetEnvId) {
-  const envId = normalizeEnvId(targetEnvId) || getDefaultEnvId();
-  if (!envId) {
-    throw new Error("缺少云环境 ID：请设置 WX_CLOUD_ENV 或 TCB_ENV");
-  }
-  const accessToken = await getAccessToken();
+async function invokeCloudFunctionWithAccessToken(name, payload, envId, accessToken) {
   const url =
     `https://api.weixin.qq.com/tcb/invokecloudfunction` +
     `?access_token=${accessToken}&env=${envId}&name=${name}`;
   const body = JSON.stringify(payload || {});
-  const { data } = await requestJson(
+  return requestJson(
     url,
     {
       method: "POST",
@@ -127,6 +168,27 @@ async function invokeCloudFunction(name, payload, targetEnvId) {
     },
     body
   );
+}
+
+async function invokeCloudFunction(name, payload, targetEnvId) {
+  const envId = normalizeEnvId(targetEnvId) || getDefaultEnvId();
+  if (!envId) {
+    throw new Error("缺少云环境 ID：请设置 WX_CLOUD_ENV 或 TCB_ENV");
+  }
+  const accessToken = await getAccessToken();
+  let { data } = await invokeCloudFunctionWithAccessToken(name, payload, envId, accessToken);
+  if (isInvalidCredentialResponse(data) && !process.env.WX_ACCESS_TOKEN) {
+    console.warn("[wxpush] access_token invalid, refresh and retry invokecloudfunction:", {
+      envId,
+      functionName: name,
+      errcode: data?.errcode,
+      errmsg: data?.errmsg,
+    });
+    accessTokenCache = { token: "", expiresAt: 0 };
+    const refreshedToken = await getAccessToken({ forceRefresh: true });
+    const retryResult = await invokeCloudFunctionWithAccessToken(name, payload, envId, refreshedToken);
+    data = retryResult.data;
+  }
   if (data?.errcode && data.errcode !== 0) {
     throw new Error(`调用云函数失败: ${data.errmsg || data.errcode}`);
   }
