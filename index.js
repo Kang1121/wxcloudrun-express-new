@@ -54,8 +54,8 @@ function shouldInvokeLegacyPostMediaCallback() {
 }
 
 function getAppConfig() {
-  const appid = process.env.WX_APPID || process.env.WECHAT_APPID || "";
-  const secret = process.env.WX_APPSECRET || process.env.WECHAT_APPSECRET || "";
+  const appid = String(process.env.WX_APPID || process.env.WECHAT_APPID || "").trim();
+  const secret = String(process.env.WX_APPSECRET || process.env.WECHAT_APPSECRET || "").trim();
   return { appid, secret };
 }
 
@@ -87,7 +87,7 @@ function requestJson(url, options, body) {
       res.on("end", () => {
         try {
           const data = raw ? JSON.parse(raw) : {};
-          resolve({ statusCode: res.statusCode, data });
+          resolve({ statusCode: res.statusCode, data, raw });
         } catch (err) {
           reject(err);
         }
@@ -100,9 +100,9 @@ function requestJson(url, options, body) {
 }
 
 async function fetchLegacyAccessToken(appid, secret) {
-  const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${appid}&secret=${secret}`;
-  const { data } = await requestJson(url, { method: "GET" });
-  return data || {};
+  const url = `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${encodeURIComponent(appid)}&secret=${encodeURIComponent(secret)}`;
+  const result = await requestJson(url, { method: "GET" });
+  return { source: "legacy", statusCode: result.statusCode, data: result.data || {}, raw: result.raw || "" };
 }
 
 async function fetchStableAccessToken(appid, secret, forceRefresh) {
@@ -112,7 +112,7 @@ async function fetchStableAccessToken(appid, secret, forceRefresh) {
     secret,
     force_refresh: !!forceRefresh,
   });
-  const { data } = await requestJson(
+  const result = await requestJson(
     "https://api.weixin.qq.com/cgi-bin/stable_token",
     {
       method: "POST",
@@ -123,7 +123,22 @@ async function fetchStableAccessToken(appid, secret, forceRefresh) {
     },
     body
   );
-  return data || {};
+  return { source: "stable", statusCode: result.statusCode, data: result.data || {}, raw: result.raw || "" };
+}
+
+function buildAccessTokenErrorMessage(result) {
+  const data = result?.data || {};
+  const errcode = data.errcode || data.errCode || "";
+  const errmsg = data.errmsg || data.errMsg || "";
+  const raw = String(result?.raw || "").slice(0, 200);
+  return [
+    "获取 access_token 失败",
+    `source=${result?.source || "unknown"}`,
+    `status=${result?.statusCode || ""}`,
+    errcode ? `errcode=${errcode}` : "",
+    errmsg ? `errmsg=${errmsg}` : "",
+    raw && !errmsg ? `raw=${raw}` : "",
+  ].filter(Boolean).join(": ");
 }
 
 async function getAccessToken(options = {}) {
@@ -137,16 +152,31 @@ async function getAccessToken(options = {}) {
     throw new Error("缺少 WX_APPID/WX_APPSECRET，无法获取 access_token");
   }
 
-  const data = shouldUseStableAccessToken()
+  const useStable = shouldUseStableAccessToken();
+  const result = useStable
     ? await fetchStableAccessToken(appid, secret, !!options.forceRefresh)
     : await fetchLegacyAccessToken(appid, secret);
-  if (!data || !data.access_token) {
-    throw new Error(`获取 access_token 失败: ${data?.errmsg || "unknown"}`);
+  let tokenData = result.data || {};
+  if (!tokenData.access_token && useStable) {
+    console.warn("[wxpush] stable access_token failed, fallback to legacy token:", {
+      statusCode: result.statusCode,
+      errcode: tokenData.errcode || tokenData.errCode || null,
+      errmsg: tokenData.errmsg || tokenData.errMsg || "",
+      raw: result.raw ? String(result.raw).slice(0, 200) : "",
+    });
+    const fallback = await fetchLegacyAccessToken(appid, secret);
+    tokenData = fallback.data || {};
+    if (!tokenData.access_token) {
+      throw new Error(`${buildAccessTokenErrorMessage(result)}; fallback ${buildAccessTokenErrorMessage(fallback)}`);
+    }
+  }
+  if (!tokenData.access_token) {
+    throw new Error(buildAccessTokenErrorMessage(result));
   }
 
-  const expiresIn = Number(data.expires_in || 7200);
+  const expiresIn = Number(tokenData.expires_in || 7200);
   accessTokenCache = {
-    token: data.access_token,
+    token: tokenData.access_token,
     expiresAt: Date.now() + Math.max(60, expiresIn - 300) * 1000,
   };
   return accessTokenCache.token;
